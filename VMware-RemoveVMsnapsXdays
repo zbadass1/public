@@ -1,0 +1,98 @@
+############################################################################################################
+#   Description: Remove VM snapshots from the last x days                                                  #
+#   Author: Jorge Rodriguez                                                                                #
+#   Date: 08.21.2021	                                                                                     #
+#   Source: https://getsysadminblog.com/2017/03/16/automatically-clean-up-vmware-snapshots-using-powercli/ #
+############################################################################################################
+ 
+# Set PowerCLI config
+Set-PowerCLIConfiguration -Scope User -ParticipateInCEIP $False -Confirm:$False | Out-Null
+
+# Load VMware modules
+Get-Module -ListAvailable VM* | Import-Module
+
+# Variables to fill out before running script
+$vcServer = ""    	# IP or FQDN of vcenter server.
+$vcUser = ""      	# Username of vcenter administrator.
+$vcPass = ""      	# Password of vcenter administrator.
+$mailFrom = ""   		# Sender email address.
+$mailTo = ""      	# Recipient email address.
+$mailServer = ""  	# IP or FQDN of SMTP Server.
+$logpath = ""	  		# Path to store log file.
+$testVM = ""	  		# VM Name to check snapshots. Use * to check all VMs in vCenter.
+$days = ""      		# Age of snapshot to delete in days
+
+$date = get-date -f MMddyyyy
+
+# Connect to vCenter server.
+Try{
+  Write-Host "`nConnecting to vCenter, please wait...`n" -fore green
+	connect-viserver -server $vcServer -user $vcUser -Password $vcPass -ErrorAction Stop | Out-Null
+}
+Catch [Exception]{
+	$exception = $_.Exception
+  Write-Host "Failed connecting to vCenter Server." -fore red
+  Send-MailMessage -From $mailFrom -To $mailTo -Subject "Failed connecting to vCenter to delete $days day old snapshots" -Body `
+  "The powershell script is unable to connect to host $vcServer. Please investigate.`n`n$exception.message" -SmtpServer $mailServer
+  Break
+}
+ 
+# Verify log path exists.
+If(!(Test-Path $logpath)){
+    Write-Host "Log path was not found. Creating path and continuing...`n" -fore yellow
+    New-Item $logpath -Type Directory | Out-Null
+}
+ 
+# Get all snapshots.
+If((get-snapshot -vm $testVM) -ne $null){
+    $snapshotlist = get-snapshot -vm $testVM | select VM, Name, SizeMB, @{Name="Age";Expression={((Get-Date)-$_.Created).Days}}
+    Write-Host "Snapshots in vCenter before cleanup`n" -fore green
+    $snapshotlist
+    Write-Output "Snapshots in vCenter before cleanup" | Out-File $logpath\Snapshots_$date.txt -Append
+    Write-Output $snapshotlist | Out-File $logpath\Snapshots_$date.txt -Append
+}
+ 
+# Delete snapshots older than x days.
+If((get-snapshot -vm $testVM) -ne $null){
+    get-snapshot -vm $testVM | Where-Object {$_.Created -lt (Get-Date).AddDays(-$days)} | Remove-Snapshot -Confirm:$false
+    $snapshotlist = get-snapshot -vm $testVM | select VM, Name, SizeMB, @{Name="Age";Expression={((Get-Date)-$_.Created).Days}}
+    Write-Host "`nSnapshots in vCenter after cleanup`n" -fore green
+    $snapshotlist
+    Write-Output "Snapshots in vCenter after cleanup" | Out-File $logpath\Snapshots_$date.txt -Append
+    Write-Output $snapshotlist | Out-File $logpath\Snapshots_$date.txt -Append
+}
+Else{
+	Write-Host "No snapshots found`n"
+    Write-Output "No snapshots found." | Out-File $logpath\Snapshots_$date.txt -Append
+}
+ 
+# Email snapshot log.
+Try{
+	$emailbody = "<pre>$(Get-Content $logpath\Snapshots_$date.txt | Out-String)</pre>"
+	Send-MailMessage -From $mailFrom -To $mailTo -Subject "Monthly vCenter snapshot cleanup log" -Body $emailbody  -BodyAsHtml -SmtpServer $mailServer -ErrorAction Stop
+	Write-Host "`nEmail successfully sent!`n" -fore green
+}
+Catch [Exception]{
+	$exception = $_.Exception
+	Write-Host "`nFailed to send email! See log file for details." -fore red
+	Write-Output "Failed to send email!`n$exception.message`n" | Out-File $logpath\Snapshots_$date.txt -Append
+}
+
+# Disconnect from vCenter server.
+Try{
+	Write-Host "Disconnected from vCenter server" -fore green
+    disconnect-viserver -server $vcServer -Confirm:$false -ErrorAction Stop | Out-Null
+}
+Catch [Exception]{
+	$exception = $_.Exception
+    Write-Host "`nFailed disconnecting from vCenter server." -fore red
+	Write-Output "Failed disconnecting from vCenter server.`n$exception.message"
+    Send-MailMessage -From $mailFrom -To $mailTo -Subject "Failed to disconnect from vCenter server" -Body `
+    "The powershell script was unable to disconnect from vCenter. Please disconnect manually.`n`n$exception.message" -SmtpServer $mailServer
+}
+ 
+# Delete script log files older than 30 days.
+Get-ChildItem -path $logpath -Recurse -Force | Where-Object {!$_.PSIsContainer -and $_.LastWriteTime -lt (Get-Date).AddDays(-30)} | Remove-Item -Force
+
+# Unload VMware modules
+Remove-Module VM*
